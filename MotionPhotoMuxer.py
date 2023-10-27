@@ -1,12 +1,14 @@
-import argparse
 import logging
 import os
 import sys
 from os.path import exists, basename, isdir
 import shutil
 import subprocess
+from pathlib import Path
+from tqdm import tqdm
 
-import pyexiv2
+# import pyexiv2
+
 
 def validate_directory(dir):
     if not exists(dir):
@@ -30,10 +32,10 @@ def validate_media(photo_path, video_path):
     if not exists(video_path):
         logging.error("Video does not exist: {}".format(video_path))
         return False
-    if not photo_path.lower().endswith(('.jpg', '.jpeg', '.heic')):
+    if not photo_path.name.lower().endswith(('.jpg', '.jpeg', '.heic')):
         logging.error("Photo isn't a JPEG: {}".format(photo_path))
         return False
-    if not video_path.lower().endswith(('.mov', '.mp4')):
+    if not video_path.name.lower().endswith(('.mov', '.mp4')):
         logging.error("Video isn't a MOV or MP4: {}".format(photo_path))
         return False
     return True
@@ -84,8 +86,12 @@ def merge_files(photo_path, video_path, output_path):
     return out_path
 
 
-def add_xmp_metadata(merged_file, offset):
-    return add_xmp_metadata_exiftool(merged_file, offset)
+def add_xmp_metadata(merged_file, offset, metadata_tool):
+    if metadata_tool == "exiftool":
+        return add_xmp_metadata_exiftool(merged_file, offset)
+    if metadata_tool == "pyexiv2":
+        return add_xmp_metadata_pyexiv2(merged_file, offset)
+    raise Exception(f"The {metadata_tool} is not exiftool or pyexiv2.")
 
 def add_xmp_metadata_exiftool(merged_file, offset):
     """Adds XMP metadata to the merged image indicating the byte offset in the file where the video begins.
@@ -143,7 +149,7 @@ def add_xmp_metadata_pyexiv2(merged_file, offset):
         print("-xmp:{}={} \\".format(k.replace('Xmp.GCamera.', ''), rawval))
 
 
-def convert(photo_path, video_path, output_path):
+def convert(photo_path, video_path, output_path, metadata_tool):
     """
     Performs the conversion process to mux the files together into a Google Motion Photo.
     :param photo_path: path to the photo to merge
@@ -161,61 +167,61 @@ def convert(photo_path, video_path, output_path):
     # offset = merged_filesize - photo_filesize
     offset = os.path.getsize(video_path)
 
-    merged = add_xmp_metadata(merged, offset)
+    merged = add_xmp_metadata(merged, offset, metadata_tool)
     append_vid(merged, video_path)
-
-def matching_video(photo_path):
-    base = os.path.splitext(photo_path)[0]
-    logging.info("Looking for videos named: {}".format(base))
-    if os.path.exists(base + ".mov"):
-        return base + ".mov"
-    if os.path.exists(base + ".mp4"):
-        return base + ".mp4"
-    if os.path.exists(base + ".MOV"):
-        return base + ".MOV"
-    if os.path.exists(base + ".MP4"):
-        return base + ".MP4"
-    else:
-        return ""
 
 
 def process_directory(file_dir, recurse, outdir):
     """
     Loops through files in the specified directory and generates a list of (photo, video) path tuples that can
     be converted
-    :TODO: Implement recursive scan
     :param file_dir: directory to look for photos/videos to convert
     :param recurse: if true, subdirectories will recursively be processes
     :return: a list of tuples containing matched photo/video pairs.
     """
     logging.info("Processing dir: {}".format(file_dir))
+
+    file_dir = Path(file_dir)
+    photoExts = ["jpg","jpeg","heic"]
+    videoExts = ["mov", "mp4"]
+    photos: list[Path] = []
+    videos: list[Path] = []
+    pattern = "*."
     if recurse:
-        logging.error("Recursive traversal is not implemented yet.")
-        exit(1)
+        pattern = "**/*."
+    
+    for ext in photoExts:
+        photos += file_dir.rglob(f"{pattern}{ext}")
+    for ext in videoExts:
+        videos += file_dir.rglob(f"{pattern}{ext}")
 
-    file_pairs = []
-    leftover_cand = []
-    for file in os.listdir(file_dir):
-        if '.DS_Store' in file:
-            continue
-        file_fullpath = os.path.join(file_dir, file)
-        if os.path.isfile(file_fullpath) and file.lower().endswith(('.jpg', '.jpeg', '.heic')) and matching_video(
-                file_fullpath) != "":
-            file_pairs.append((file_fullpath, matching_video(file_fullpath)))
-        else:
-            leftover_cand.append(file_fullpath)
+    stem_map = {}
+    for video in videos:
+        stem_map[video.stem] = video
+    
+    file_pairs: list[tuple[Path, Path]] = []
+    for photo in photos:
+        if photo.stem in stem_map:
+            file_pairs.append((photo, stem_map[photo.stem]))
 
-    allvideos = set([vid.lower() for (img, vid) in file_pairs])
-    leftover = []
-    for lo in leftover_cand:
-        if lo.lower() not in allvideos:
+    leftover:list[Path] = []
+    allvideos = set([vid.absolute() for (img, vid) in file_pairs])
+    for lo in videos:
+        if lo not in allvideos:
             leftover.append(lo)
-
+    allphotos = set([img.absolute()  for (img, vid) in file_pairs])
+    for lo in photos:
+        if lo not in allphotos:
+            leftover.append(lo)
+            
     logging.info("Found {} pairs, {} left over.".format(len(file_pairs), len(leftover)))
-    logging.info("Left overs:")
-    for lo in leftover:
-        logging.info(lo)
-        shutil.copy2(lo, outdir)
+    logging.info(f"Copy left overs to {outdir}")
+    for lo in tqdm(leftover):
+        out_path = (outdir / lo.relative_to(file_dir)).absolute().resolve()
+        # logging.info(f"{lo.absolute().resolve()} -> {out_path}")
+        os.makedirs(out_path.parent, exist_ok=True)
+        shutil.copy2(lo.absolute().resolve(), out_path)
+        
     logging.info("Image/video pairs:")
     for (img, vid) in file_pairs:
         logging.info('{} {}'.format(img, vid))
@@ -224,40 +230,36 @@ def process_directory(file_dir, recurse, outdir):
 
 def main(args):
     logging_level = logging.INFO if args.verbose else logging.ERROR
-    logging.basicConfig(level=logging_level, stream=sys.stdout)
+    logging.basicConfig(level=logging_level, stream=sys.stdout, format='[%(asctime)s] {%(name)s:%(funcName)s:%(lineno)d} %(levelname)s - %(message)s')
     logging.info("Enabled verbose logging")
 
-    outdir = args.output if args.output is not None else args.dir + "-output"
+    outdir = args.dir + "-output"
     os.makedirs(outdir, exist_ok=True)
 
     if args.dir is not None:
         validate_directory(args.dir)
         pairs = process_directory(args.dir, args.recurse, outdir)
         for pair in pairs:
+            print(pair)
             if validate_media(pair[0], pair[1]):
-                convert(pair[0], pair[1], outdir)
-    else:
-        if args.photo is None and args.video is None:
-            logging.error("Either --dir or --photo and --video are required.")
-            exit(1)
-
-        if bool(args.photo) ^ bool(args.video):
-            logging.error("Both --photo and --video must be provided.")
-            exit(1)
-
-        if validate_media(args.photo, args.video):
-            convert(args.photo, args.video, outdir)
+                convert(pair[0], pair[1], outdir, args.metadata_tool)
 
 
 if __name__ == '__main__':
+    import argparse
+    import logging
+    import sys
+
+
     parser = argparse.ArgumentParser(
         description='Merges a photo and video into a Microvideo-formatted Google Motion Photo')
     parser.add_argument('--verbose', help='Show logging messages.', action='store_true')
+    parser.add_argument('--metadata-tool', help='Select tool to modify metadata [pexiv2(default)|exiftool]', default="pyexiv2")
     parser.add_argument('--dir', type=str, help='Process a directory for photos/videos. Takes precedence over '
                                                 '--photo/--video')
     parser.add_argument('--recurse', help='Recursively process a directory. Only applies if --dir is also provided',
                         action='store_true')
-    parser.add_argument('--photo', type=str, help='Path to the JPEG photo to add.')
-    parser.add_argument('--video', type=str, help='Path to the MOV video to add.')
-    parser.add_argument('--output', type=str, help='Path to where files should be written out to.')
+    # parser.add_argument('--output', type=str, help='Path to where files should be written out to.')
+
+
     main(parser.parse_args())

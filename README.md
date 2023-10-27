@@ -1,10 +1,6 @@
 MotionPhotoMuxer
 ================
 
-> **Note**
-> I've switched back to Android for the time being. I do have access to an iPhone for testing, but
-> likely won't be focusing on developing this much further.
-
 Convert Apple Live Photos into Google Motion Photos commonly found on Android phones.
 
 # Installation
